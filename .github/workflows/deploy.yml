@@ -114,7 +114,7 @@ jobs:
       - name: Update Helm values
         run: |
           IMAGE_TAG=${{ github.sha }}
-          for service in $(echo '${{ needs.detect-changes.outputs.services }}' | jq -r '.[]'); do
+          for service in $(echo "${{ needs.detect-changes.outputs.services }}" | jq -r '.[]'); do
             VALUES_FILE="src/$service/chart/values.yaml"
             if [[ -f "$VALUES_FILE" ]]; then
               echo "🔧 Updating $VALUES_FILE with tag $IMAGE_TAG"
