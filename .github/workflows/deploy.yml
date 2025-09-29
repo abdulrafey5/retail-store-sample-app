@@ -15,16 +15,16 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2   # ✅ needed for HEAD~1
+          fetch-depth: 0   # ✅ ensure full history
 
       - name: Detect changed services
         id: detect
         run: |
-          # Handle case where repo has only one commit
+          # Find changed files (fallback to all files if first commit)
           if git rev-parse HEAD~1 >/dev/null 2>&1; then
             CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD)
           else
-            echo "⚠️ First commit detected, treating all files as changed"
+            echo "⚠️ First commit detected, using all files"
             CHANGED_FILES=$(git ls-files)
           fi
 
@@ -41,13 +41,18 @@ jobs:
           UNIQUE_SERVICES=$(echo "$SERVICES" | xargs -n1 | sort -u | xargs)
           echo "Detected services: $UNIQUE_SERVICES"
 
-          # Convert to JSON array for matrix
-          JSON_SERVICES=$(printf '%s\n' $UNIQUE_SERVICES | jq -R . | jq -s .)
+          # Convert to JSON array
+          if [[ -n "$UNIQUE_SERVICES" ]]; then
+            JSON_SERVICES=$(printf '%s\n' $UNIQUE_SERVICES | jq -R . | jq -s .)
+          else
+            JSON_SERVICES="[]"
+          fi
+
           echo "services=$JSON_SERVICES" >> $GITHUB_OUTPUT
 
   build-and-push:
     needs: detect-changes
-    if: ${{ needs.detect-changes.outputs.services != '' }}
+    if: ${{ needs.detect-changes.outputs.services != '[]' }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -69,13 +74,14 @@ jobs:
           | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
 
       - name: Ensure ECR repo exists
+        if: matrix.service != 'app'
         run: |
           REPO_NAME="retail-store/${{ matrix.service }}"
           aws ecr describe-repositories --repository-names "$REPO_NAME" >/dev/null 2>&1 || \
           aws ecr create-repository --repository-name "$REPO_NAME"
 
       - name: Build and Push Docker image
-        if: matrix.service != 'app'   # skip app if needed
+        if: matrix.service != 'app'
         run: |
           IMAGE_TAG=${{ github.sha }}
           IMAGE=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/retail-store/${{ matrix.service }}:$IMAGE_TAG
@@ -86,13 +92,13 @@ jobs:
 
   update-helm:
     needs: [detect-changes, build-and-push]
-    if: ${{ needs.detect-changes.outputs.services != '' }}
+    if: ${{ needs.detect-changes.outputs.services != '[]' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # ✅ required for committing
+          fetch-depth: 0
 
       - name: Install yq
         run: |
@@ -107,8 +113,6 @@ jobs:
             if [[ -f "$VALUES_FILE" ]]; then
               echo "🔧 Updating $VALUES_FILE with tag $IMAGE_TAG"
               yq -i ".image.tag = \"$IMAGE_TAG\"" "$VALUES_FILE"
-            else
-              echo "⚠️ $VALUES_FILE not found, skipping"
             fi
           done
 
@@ -129,8 +133,5 @@ jobs:
     steps:
       - name: Notify
         run: |
-          if [[ "${{ needs.detect-changes.outputs.services }}" == "" ]]; then
-            echo "✅ No service changes detected."
-          else
-            echo "✅ Deployment finished for services: ${{ needs.detect-changes.outputs.services }}"
-          fi
+          echo "🟢 Services detected: ${{ needs.detect-changes.outputs.services }}"
+          echo "✅ Workflow finished!"
