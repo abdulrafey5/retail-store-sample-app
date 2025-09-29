@@ -9,7 +9,7 @@ jobs:
   detect-changes:
     runs-on: ubuntu-latest
     outputs:
-      services: ${{ steps.set-services.outputs.services }}
+      services: ${{ steps.detect.outputs.services }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -28,21 +28,16 @@ jobs:
             fi
           done
 
-          # Remove duplicates
           UNIQUE_SERVICES=$(echo "$SERVICES" | xargs -n1 | sort -u | xargs)
           echo "Detected services: $UNIQUE_SERVICES"
 
-          # Export as JSON array for matrix
+          # convert to JSON array
           JSON_SERVICES=$(printf '%s\n' $UNIQUE_SERVICES | jq -R . | jq -s .)
           echo "services=$JSON_SERVICES" >> $GITHUB_OUTPUT
 
-      - name: Show detected services
-        run: echo "Detected: ${{ steps.detect.outputs.services }}"
-        id: set-services
-
   build-and-push:
     needs: detect-changes
-    if: needs.detect-changes.outputs.services != '[]'
+    if: ${{ needs.detect-changes.outputs.services != '' }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -64,7 +59,7 @@ jobs:
           | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
 
       - name: Build and Push Docker image
-        if: matrix.service != 'app' # skip app (no Dockerfile)
+        if: matrix.service != 'app'
         run: |
           IMAGE_TAG=${{ github.sha }}
           IMAGE=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/retail-store/${{ matrix.service }}:$IMAGE_TAG
@@ -72,12 +67,9 @@ jobs:
           docker build -t $IMAGE ./src/${{ matrix.service }}
           docker push $IMAGE
 
-      - name: Save image tag
-        run: echo "image_tag=${{ github.sha }}" >> $GITHUB_ENV
-
   update-helm:
     needs: [detect-changes, build-and-push]
-    if: needs.detect-changes.outputs.services != '[]'
+    if: ${{ needs.detect-changes.outputs.services != '' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
@@ -101,11 +93,11 @@ jobs:
 
           git checkout -B gitops
           git add .
-          git commit -m "Update Helm values with new image tags"
+          git commit -m "Update Helm values for ${{ needs.detect-changes.outputs.services }} with tag ${{ github.sha }}" || echo "No changes to commit"
           git push origin gitops --force
 
   notification:
-    needs: [update-helm]
+    needs: update-helm
     runs-on: ubuntu-latest
     steps:
       - name: Notify
