@@ -49,10 +49,13 @@ jobs:
           done
 
           if [[ ${#CHANGED_SERVICES[@]} -gt 0 ]]; then
-            ALL_JSON=$(printf '%s\n' "${CHANGED_SERVICES[@]}" | jq -R . | jq -s .)
+            # JSON array for matrix
             BUILD_JSON=$(printf '%s\n' "${BUILD_SERVICES[@]}" | jq -R . | jq -s .)
 
-            echo "changed_services=${CHANGED_SERVICES[*]}" >> $GITHUB_OUTPUT
+            # Space-separated list for looping
+            CHANGED_STRING="${CHANGED_SERVICES[*]}"
+
+            echo "changed_services=$CHANGED_STRING" >> $GITHUB_OUTPUT
             echo "matrix={\"service\": $BUILD_JSON}" >> $GITHUB_OUTPUT
             echo "has_changes=true" >> $GITHUB_OUTPUT
           else
