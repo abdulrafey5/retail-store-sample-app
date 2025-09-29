@@ -13,174 +13,106 @@ env:
 
 jobs:
   detect-changes:
-    name: Detect Changes
     runs-on: ubuntu-latest
     outputs:
-      changed_services: ${{ steps.changes.outputs.changed_services }}
-      matrix: ${{ steps.changes.outputs.matrix }}
-      has_changes: ${{ steps.changes.outputs.has_changes }}
+      services: ${{ steps.set-services.outputs.services }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
       - name: Detect changed services
-        id: changes
+        id: detect
         run: |
           CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD)
           echo "Changed files: $CHANGED_FILES"
 
-          CHANGED_SERVICES=()
-          BUILD_SERVICES=()
-
-          for service_dir in src/*/; do
-            if [[ -d "$service_dir" ]]; then
-              service_name=$(basename "$service_dir")
-
-              if echo "$CHANGED_FILES" | grep -q "^src/$service_name/"; then
-                echo "Detected changes in service: $service_name"
-                CHANGED_SERVICES+=("$service_name")
-                # Skip Docker build for app
-                if [[ "$service_name" != "app" ]]; then
-                  BUILD_SERVICES+=("$service_name")
-                fi
-              fi
+          SERVICES=""
+          for path in $CHANGED_FILES; do
+            if [[ $path == src/*/* ]]; then
+              SERVICE=$(echo "$path" | cut -d'/' -f2)
+              SERVICES="$SERVICES $SERVICE"
             fi
           done
 
-          if [[ ${#CHANGED_SERVICES[@]} -gt 0 ]]; then
-            # Build JSON matrix as array of objects { "name": "service" }
-            BUILD_JSON=$(printf '%s\n' "${BUILD_SERVICES[@]}" | jq -R '{name: .}' | jq -s .)
+          # Remove duplicates
+          UNIQUE_SERVICES=$(echo "$SERVICES" | xargs -n1 | sort -u | xargs)
+          echo "Detected services: $UNIQUE_SERVICES"
 
-            CHANGED_STRING="${CHANGED_SERVICES[*]}"
+          # Export as JSON array for matrix
+          JSON_SERVICES=$(printf '%s\n' $UNIQUE_SERVICES | jq -R . | jq -s .)
+          echo "services=$JSON_SERVICES" >> $GITHUB_OUTPUT
 
-            echo "changed_services=$CHANGED_STRING" >> $GITHUB_OUTPUT
-            echo "matrix={\"service\": $BUILD_JSON}" >> $GITHUB_OUTPUT
-            echo "has_changes=true" >> $GITHUB_OUTPUT
-          else
-            echo "No service changes detected"
-            echo "changed_services=" >> $GITHUB_OUTPUT
-            echo "matrix={\"service\": []}" >> $GITHUB_OUTPUT
-            echo "has_changes=false" >> $GITHUB_OUTPUT
-          fi
+      - name: Show detected services
+        run: echo "Detected: ${{ steps.detect.outputs.services }}"
+        id: set-services
 
   build-and-push:
-    name: Build & Push Docker Images
-    runs-on: ubuntu-latest
     needs: detect-changes
-    if: needs.detect-changes.outputs.has_changes == 'true'
+    if: needs.detect-changes.outputs.services != '[]'
+    runs-on: ubuntu-latest
     strategy:
-      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+      matrix:
+        service: ${{ fromJson(needs.detect-changes.outputs.services) }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Configure AWS credentials
+      - name: Configure AWS
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Login to Amazon ECR
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Ensure ECR repository
+      - name: Login to ECR
         run: |
-          REPO_NAME="retail-store/${{ matrix.name }}"
-          if ! aws ecr describe-repositories --repository-names "$REPO_NAME" >/dev/null 2>&1; then
-            echo "Creating ECR repository $REPO_NAME"
-            aws ecr create-repository --repository-name "$REPO_NAME"
-          fi
+          aws ecr get-login-password --region ${{ secrets.AWS_REGION }} \
+          | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.ECR_REGISTRY }}/retail-store/${{ matrix.name }}
-          tags: |
-            type=ref,event=branch
-            type=sha,prefix={{branch}}-
-            type=raw,value=latest,enable={{is_default_branch}}
+      - name: Build and Push Docker image
+        if: matrix.service != 'app' # skip app (no Dockerfile)
+        run: |
+          IMAGE_TAG=${{ github.sha }}
+          IMAGE=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/retail-store/${{ matrix.service }}:$IMAGE_TAG
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: ./src/${{ matrix.name }}
-          platforms: linux/amd64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          docker build -t $IMAGE ./src/${{ matrix.service }}
+          docker push $IMAGE
 
-  update-helm-values:
-    name: Update Helm Values
+      - name: Save image tag
+        run: echo "image_tag=${{ github.sha }}" >> $GITHUB_ENV
+
+  update-helm:
+    needs: [detect-changes, build-and-push]
+    if: needs.detect-changes.outputs.services != '[]'
     runs-on: ubuntu-latest
-    needs: detect-changes
-    if: needs.detect-changes.outputs.has_changes == 'true'
     steps:
-      - uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          ref: main
-          fetch-depth: 0
-
-      - name: Install yq
-        run: |
-          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
-          sudo chmod +x /usr/local/bin/yq
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
       - name: Update Helm values
         run: |
-          CHANGED_SERVICES="${{ needs.detect-changes.outputs.changed_services }}"
-          COMMIT_SHA="${{ github.sha }}"
-
-          for service in $CHANGED_SERVICES; do
+          IMAGE_TAG=${{ github.sha }}
+          for service in $(echo '${{ needs.detect-changes.outputs.services }}' | jq -r '.[]'); do
             VALUES_FILE="src/$service/chart/values.yaml"
             if [[ -f "$VALUES_FILE" ]]; then
-              yq eval ".image.tag = \"$COMMIT_SHA\"" -i "$VALUES_FILE"
-              echo "Updated $service image tag to $COMMIT_SHA in $VALUES_FILE"
-            else
-              echo "Warning: $VALUES_FILE not found"
+              echo "Updating $VALUES_FILE with tag $IMAGE_TAG"
+              yq -i ".image.tag = \"$IMAGE_TAG\"" "$VALUES_FILE"
             fi
           done
 
-      - name: Commit & Push to gitops branch
+      - name: Commit changes to gitops branch
         run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
 
           git checkout -B gitops
-
-          if git diff --quiet; then
-            echo "No Helm values changes to commit"
-            exit 0
-          fi
-
-          git add src/*/chart/values.yaml
-          git commit -m "chore: update image tags for: ${{ needs.detect-changes.outputs.changed_services }}
-          
-          Commit: ${{ github.sha }}"
+          git add .
+          git commit -m "Update Helm values with new image tags"
           git push origin gitops --force
 
-  notify:
-    name: Notification
+  notification:
+    needs: [update-helm]
     runs-on: ubuntu-latest
-    needs: [detect-changes, build-and-push, update-helm-values]
-    if: always()
     steps:
-      - name: Deployment Status
-        run: |
-          if [[ "${{ needs.detect-changes.outputs.has_changes }}" == "false" ]]; then
-            echo "✅ No changes detected in source code"
-          elif [[ "${{ needs.build-and-push.result }}" == "success" && "${{ needs.update-helm-values.result }}" == "success" ]]; then
-            echo "✅ Successfully deployed services: ${{ needs.detect-changes.outputs.changed_services }}"
-            echo "🐳 Docker images pushed to ECR"
-            echo "⎈ Helm values updated in gitops branch"
-          else
-            echo "❌ Deployment failed for services: ${{ needs.detect-changes.outputs.changed_services }}"
-            exit 1
-          fi
+      - name: Notify
+        run: echo "✅ Deployment workflow finished!"
