@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 jobs:
   detect-changes:
@@ -13,11 +14,20 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2   # ✅ needed for HEAD~1
 
       - name: Detect changed services
         id: detect
         run: |
-          CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD)
+          # Handle case where repo has only one commit
+          if git rev-parse HEAD~1 >/dev/null 2>&1; then
+            CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD)
+          else
+            echo "⚠️ First commit detected, treating all files as changed"
+            CHANGED_FILES=$(git ls-files)
+          fi
+
           echo "Changed files: $CHANGED_FILES"
 
           SERVICES=""
@@ -31,7 +41,7 @@ jobs:
           UNIQUE_SERVICES=$(echo "$SERVICES" | xargs -n1 | sort -u | xargs)
           echo "Detected services: $UNIQUE_SERVICES"
 
-          # convert to JSON array
+          # Convert to JSON array for matrix
           JSON_SERVICES=$(printf '%s\n' $UNIQUE_SERVICES | jq -R . | jq -s .)
           echo "services=$JSON_SERVICES" >> $GITHUB_OUTPUT
 
@@ -58,12 +68,19 @@ jobs:
           aws ecr get-login-password --region ${{ secrets.AWS_REGION }} \
           | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
 
+      - name: Ensure ECR repo exists
+        run: |
+          REPO_NAME="retail-store/${{ matrix.service }}"
+          aws ecr describe-repositories --repository-names "$REPO_NAME" >/dev/null 2>&1 || \
+          aws ecr create-repository --repository-name "$REPO_NAME"
+
       - name: Build and Push Docker image
-        if: matrix.service != 'app'
+        if: matrix.service != 'app'   # skip app if needed
         run: |
           IMAGE_TAG=${{ github.sha }}
           IMAGE=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/retail-store/${{ matrix.service }}:$IMAGE_TAG
 
+          echo "🚀 Building and pushing $IMAGE"
           docker build -t $IMAGE ./src/${{ matrix.service }}
           docker push $IMAGE
 
@@ -74,6 +91,13 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # ✅ required for committing
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
 
       - name: Update Helm values
         run: |
@@ -81,8 +105,10 @@ jobs:
           for service in $(echo '${{ needs.detect-changes.outputs.services }}' | jq -r '.[]'); do
             VALUES_FILE="src/$service/chart/values.yaml"
             if [[ -f "$VALUES_FILE" ]]; then
-              echo "Updating $VALUES_FILE with tag $IMAGE_TAG"
+              echo "🔧 Updating $VALUES_FILE with tag $IMAGE_TAG"
               yq -i ".image.tag = \"$IMAGE_TAG\"" "$VALUES_FILE"
+            else
+              echo "⚠️ $VALUES_FILE not found, skipping"
             fi
           done
 
@@ -92,13 +118,19 @@ jobs:
           git config --global user.email "github-actions@github.com"
 
           git checkout -B gitops
-          git add .
-          git commit -m "Update Helm values for ${{ needs.detect-changes.outputs.services }} with tag ${{ github.sha }}" || echo "No changes to commit"
+          git add src/*/chart/values.yaml
+          git commit -m "chore: update Helm values for ${{ needs.detect-changes.outputs.services }} with tag ${{ github.sha }}" || echo "No changes to commit"
           git push origin gitops --force
 
   notification:
-    needs: update-helm
+    needs: [detect-changes, build-and-push, update-helm]
     runs-on: ubuntu-latest
+    if: always()
     steps:
       - name: Notify
-        run: echo "✅ Deployment workflow finished!"
+        run: |
+          if [[ "${{ needs.detect-changes.outputs.services }}" == "" ]]; then
+            echo "✅ No service changes detected."
+          else
+            echo "✅ Deployment finished for services: ${{ needs.detect-changes.outputs.services }}"
+          fi
