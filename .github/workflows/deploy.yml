@@ -49,10 +49,9 @@ jobs:
           done
 
           if [[ ${#CHANGED_SERVICES[@]} -gt 0 ]]; then
-            # JSON array for matrix
-            BUILD_JSON=$(printf '%s\n' "${BUILD_SERVICES[@]}" | jq -R . | jq -s .)
+            # Build JSON matrix as array of objects { "name": "service" }
+            BUILD_JSON=$(printf '%s\n' "${BUILD_SERVICES[@]}" | jq -R '{name: .}' | jq -s .)
 
-            # Space-separated list for looping
             CHANGED_STRING="${CHANGED_SERVICES[*]}"
 
             echo "changed_services=$CHANGED_STRING" >> $GITHUB_OUTPUT
@@ -90,7 +89,7 @@ jobs:
 
       - name: Ensure ECR repository
         run: |
-          REPO_NAME="retail-store/${{ matrix.service }}"
+          REPO_NAME="retail-store/${{ matrix.name }}"
           if ! aws ecr describe-repositories --repository-names "$REPO_NAME" >/dev/null 2>&1; then
             echo "Creating ECR repository $REPO_NAME"
             aws ecr create-repository --repository-name "$REPO_NAME"
@@ -100,7 +99,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.ECR_REGISTRY }}/retail-store/${{ matrix.service }}
+          images: ${{ env.ECR_REGISTRY }}/retail-store/${{ matrix.name }}
           tags: |
             type=ref,event=branch
             type=sha,prefix={{branch}}-
@@ -109,7 +108,7 @@ jobs:
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
-          context: ./src/${{ matrix.service }}
+          context: ./src/${{ matrix.name }}
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
